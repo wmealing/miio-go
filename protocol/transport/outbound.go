@@ -7,10 +7,11 @@ import (
 	"net"
 	"time"
 
+	"sync"
+
 	"github.com/benbjohnson/clock"
 	"github.com/nickw444/miio-go/common"
 	"github.com/nickw444/miio-go/protocol/packet"
-	"sync"
 )
 
 type OutboundConn interface {
@@ -44,9 +45,9 @@ type outbound struct {
 	dest   net.Addr
 	socket OutboundConn
 
-	nextReqID     requestID
+	nextReqID          requestID
 	continuationsMutex sync.RWMutex
-	continuations map[requestID]chan []byte
+	continuations      map[requestID]chan []byte
 }
 
 func NewOutbound(crypto packet.Crypto, dest net.Addr, socket OutboundConn) Outbound {

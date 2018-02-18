@@ -5,10 +5,13 @@ import (
 	"sync"
 	"time"
 
+	"fmt"
+
 	"github.com/benbjohnson/clock"
 	"github.com/nickw444/miio-go/common"
 	"github.com/nickw444/miio-go/device"
 	"github.com/nickw444/miio-go/protocol/packet"
+	"github.com/nickw444/miio-go/protocol/tokens"
 	"github.com/nickw444/miio-go/protocol/transport"
 	"github.com/nickw444/miio-go/subscription"
 )
@@ -26,6 +29,7 @@ type protocol struct {
 	expireAfter   time.Duration
 	clock         clock.Clock
 	lastDiscovery time.Time
+	tokenStore    tokens.TokenStore
 
 	broadcastDev device.Device
 	quitChan     chan struct{}
@@ -42,12 +46,13 @@ type CryptoFactory func(deviceID uint32, deviceToken []byte, initialStamp uint32
 
 type ProtocolConfig struct {
 	ListenPort int
+	TokenStore tokens.TokenStore
 }
 
-func NewProtocol(c *ProtocolConfig) (Protocol, error) {
+func NewProtocol(c ProtocolConfig) (Protocol, error) {
 	clk := clock.New()
 	var listenAddr *net.UDPAddr
-	if c != nil && c.ListenPort != 0 {
+	if c.ListenPort != 0 {
 		listenAddr = &net.UDPAddr{Port: c.ListenPort}
 	}
 
@@ -64,13 +69,13 @@ func NewProtocol(c *ProtocolConfig) (Protocol, error) {
 		return packet.NewCrypto(deviceID, deviceToken, initialStamp, stampTime, clk)
 	}
 
-	p := newProtocol(clk, t, deviceFactory, cryptoFactory, subscription.NewTarget())
+	p := newProtocol(clk, t, deviceFactory, cryptoFactory, subscription.NewTarget(), c.TokenStore)
 	p.start()
 	return p, nil
 }
 
 func newProtocol(c clock.Clock, transport transport.Transport, deviceFactory DeviceFactory,
-	crptoFactory CryptoFactory, target subscription.SubscriptionTarget) *protocol {
+	crptoFactory CryptoFactory, target subscription.SubscriptionTarget, tokenStore tokens.TokenStore) *protocol {
 
 	p := &protocol{
 		SubscriptionTarget: target,
@@ -80,6 +85,7 @@ func newProtocol(c clock.Clock, transport transport.Transport, deviceFactory Dev
 		clock:              c,
 		quitChan:           make(chan struct{}),
 		devices:            make(map[uint32]device.Device),
+		tokenStore:         tokenStore,
 	}
 
 	p.broadcastDev = p.makeBroadcastDev()
@@ -160,7 +166,22 @@ func (p *protocol) process(pkt *packet.Packet) {
 	dev := p.getDevice(pkt.Header.DeviceID)
 	if dev == nil && pkt.DataLength() == 0 {
 		// Device response to a Hello packet.
-		crypto, err := p.cryptoFactory(pkt.Header.DeviceID, pkt.Header.Checksum, pkt.Header.Stamp,
+		common.Log.Debugf("Device with id %d responded to Hello packet.", pkt.Header.DeviceID)
+
+		deviceToken := pkt.Header.Checksum
+		if pkt.HasZeroChecksum() {
+			token, err := p.tokenStore.GetToken(pkt.Header.DeviceID)
+			if err != nil {
+				common.Log.Warnf("Device with id %d is not revealing its token. You must manually collect this token and add it to the store.", pkt.Header.DeviceID)
+				return
+			} else {
+				common.Log.Debugf("Loaded token for device %d from store", pkt.Header.DeviceID)
+				deviceToken = token
+			}
+		}
+
+		fmt.Println("Device token", deviceToken)
+		crypto, err := p.cryptoFactory(pkt.Header.DeviceID, deviceToken, pkt.Header.Stamp,
 			pkt.Meta.DecodeTime)
 		if err != nil {
 			panic(err)
@@ -173,6 +194,11 @@ func (p *protocol) process(pkt *packet.Packet) {
 		// packets that may occur during classification.
 		p.addDevice(baseDev)
 
+		common.Log.Info("Get Test")
+		data, err := t.Call("toggle", nil)
+		common.Log.Info("Response", string(data))
+
+		common.Log.Infof("Classifying device...")
 		dev, err := device.Classify(baseDev)
 		if err != nil {
 			panic(err)
@@ -183,6 +209,7 @@ func (p *protocol) process(pkt *packet.Packet) {
 		p.Publish(common.EventNewDevice{Device: dev})
 	} else if dev != nil {
 		// Known device. Handle the incoming packet.
+
 		err := dev.Handle(pkt)
 		if err != nil {
 			common.Log.Errorf("Unable to process packet %s for device %d. Error %s", pkt, dev.ID(), err)
